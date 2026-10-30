@@ -1,0 +1,78 @@
+name: Rollback manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Ambiente para rollback'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        description: 'Tag da imagem (SHA do commit) para a qual reverter. Ex: a1b2c3d'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: lacrei-devops-challenge
+
+jobs:
+  rollback:
+    name: Rollback em ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Configurar credenciais AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolver ARN da conta e montar URI da imagem
+        id: image
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE_URI="$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.event.inputs.image_tag }}"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Confirmar que a imagem existe no ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPOSITORY }}" \
+            --image-ids imageTag="${{ github.event.inputs.image_tag }}"
+
+      - name: Selecionar instancia alvo
+        id: target
+        run: |
+          if [ "${{ github.event.inputs.environment }}" = "production" ]; then
+            echo "instance_id=${{ secrets.PRODUCTION_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+            echo "domain=${{ vars.APP_DOMAIN }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "instance_id=${{ secrets.STAGING_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+            echo "domain=staging.${{ vars.APP_DOMAIN }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Executar rollback via SSM
+        run: |
+          aws ssm send-command \
+            --instance-ids "${{ steps.target.outputs.instance_id }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["/opt/lacrei-devops-challenge/deploy.sh ${{ steps.image.outputs.image_uri }}"]}' \
+            --comment "Rollback manual para tag ${{ github.event.inputs.image_tag }} em ${{ github.event.inputs.environment }}"
+
+      - name: Smoke test pos-rollback
+        run: |
+          sleep 15
+          for i in $(seq 1 10); do
+            if curl -sf "https://${{ steps.target.outputs.domain }}/status"; then exit 0; fi
+            sleep 5
+          done
+          echo "Smoke test pos-rollback falhou" && exit 1
