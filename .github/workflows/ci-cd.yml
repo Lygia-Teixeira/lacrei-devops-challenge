@@ -1,0 +1,155 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write # necessario para OIDC com a AWS (sem chaves de acesso de longa duracao)
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: lacrei-devops-challenge
+
+jobs:
+  lint-and-test:
+    name: Lint & Testes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  build-and-scan:
+    name: Build da imagem + scan de vulnerabilidades
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build da imagem Docker
+        run: docker build -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+
+      - name: Scan de vulnerabilidades (Trivy)
+        # Fixado por SHA (v0.36.0): as tags antigas da action foram removidas apos o incidente de supply chain de 2026
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+
+      - name: Validacao funcional do container (smoke test local)
+        run: |
+          docker run -d --name smoke-test -p 3000:3000 -e NODE_ENV=test ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          for i in $(seq 1 10); do
+            if curl -sf http://localhost:3000/status; then echo "OK"; break; fi
+            echo "Aguardando aplicacao subir... ($i/10)"; sleep 2
+          done
+          curl -sf http://localhost:3000/status | grep '"status":"ok"'
+          docker rm -f smoke-test
+
+  push-image:
+    name: Push da imagem para o ECR
+    needs: build-and-scan
+    # Deploy so roda quando a infraestrutura AWS estiver provisionada (variavel de repositorio DEPLOY_ENABLED=true)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.tag.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag e push
+        id: tag
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  deploy-staging:
+    name: Deploy em Staging
+    needs: push-image
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.${{ vars.APP_DOMAIN }}/status
+    steps:
+      - name: Configurar credenciais AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Disparar deploy via SSM na instancia de staging
+        run: |
+          aws ssm send-command \
+            --instance-ids "${{ secrets.STAGING_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["/opt/lacrei-devops-challenge/deploy.sh ${{ needs.push-image.outputs.image-uri }}"]}' \
+            --comment "Deploy staging via GitHub Actions - ${{ github.sha }}"
+
+      - name: Smoke test em staging
+        run: |
+          sleep 15
+          for i in $(seq 1 10); do
+            if curl -sf "https://staging.${{ vars.APP_DOMAIN }}/status"; then exit 0; fi
+            sleep 5
+          done
+          echo "Smoke test de staging falhou" && exit 1
+
+  deploy-production:
+    name: Deploy em Producao
+    needs: [push-image, deploy-staging]
+    runs-on: ubuntu-latest
+    # O ambiente "production" deve ter "required reviewers" configurado em
+    # Settings > Environments no GitHub, garantindo aprovacao manual antes do deploy.
+    environment:
+      name: production
+      url: https://${{ vars.APP_DOMAIN }}/status
+    steps:
+      - name: Configurar credenciais AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Disparar deploy via SSM na instancia de producao
+        run: |
+          aws ssm send-command \
+            --instance-ids "${{ secrets.PRODUCTION_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["/opt/lacrei-devops-challenge/deploy.sh ${{ needs.push-image.outputs.image-uri }}"]}' \
+            --comment "Deploy producao via GitHub Actions - ${{ github.sha }}"
+
+      - name: Smoke test em producao
+        run: |
+          sleep 15
+          for i in $(seq 1 10); do
+            if curl -sf "https://${{ vars.APP_DOMAIN }}/status"; then exit 0; fi
+            sleep 5
+          done
+          echo "Smoke test de producao falhou" && exit 1
