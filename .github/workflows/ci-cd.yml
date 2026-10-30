@@ -46,7 +46,8 @@ jobs:
         with:
           image-ref: ${{ env.ECR_REPOSITORY }}:${{ github.sha }}
           format: table
-          severity: CRITICAL,
+          severity: CRITICAL,HIGH
+          # Bloqueia apenas o que ja tem correcao publicada; CVEs sem patch ficam visiveis na tabela
           ignore-unfixed: true
           exit-code: '1'
 
