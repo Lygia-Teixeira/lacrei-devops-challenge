@@ -1,13 +1,18 @@
 # --- Estágio 1: build/dependências ---
-FROM node:20-alpine AS deps
+FROM node:24-alpine AS deps
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install --omit=dev --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 
 # --- Estágio 2: imagem final de execução ---
-FROM node:20-alpine AS runtime
+FROM node:24-alpine AS runtime
 
-RUN apk add --no-cache dumb-init && \
+# Atualiza os pacotes do sistema e remove npm/npx/corepack/yarn, que não são
+# usados em execução e trazem dependências próprias com CVEs (menor superfície de ataque)
+RUN apk upgrade --no-cache && \
+    apk add --no-cache dumb-init && \
+    rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx \
+           /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-* && \
     addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
