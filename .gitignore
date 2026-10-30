@@ -1,0 +1,14 @@
+node_modules/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+tfplan
+terraform.tfvars
+*.auto.tfvars
+!terraform.tfvars.example

@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log
+__tests__
+.git
+.github
+.env
+.env.*
+terraform
+docs
+*.md
+coverage
